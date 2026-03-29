@@ -1,8 +1,7 @@
 import asyncio
 import json
-import os
 import re
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -17,11 +16,15 @@ from aiogram.types import (
     Message,
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("BOT_TOKEN", "8681677219:AAHXp6ckwJiX8QcWX4S9ZUMVJZ0uJXp1JB0")
+# ══════════════════════════════════════════════
+#  ВСТАВЬ СВОЙ ТОКЕН СЮДА (от @BotFather)
+TOKEN = "8681677219:AAHXp6ckwJiX8QcWX4S9ZUMVJZ0uJXp1JB0"
+# ══════════════════════════════════════════════
+
 DATA_FILE = Path("data.json")
 
-# ── Persistence ───────────────────────────────────────────────────────────────
+
+# ── Сохранение данных ─────────────────────────
 
 def load_data() -> dict:
     if DATA_FILE.exists():
@@ -39,19 +42,25 @@ def get_user(data: dict, uid: int) -> dict:
         data[key] = {"vitamins": [], "log": []}
     return data[key]
 
-# ── FSM ───────────────────────────────────────────────────────────────────────
+
+# ── FSM состояния ─────────────────────────────
 
 class AddVitamin(StatesGroup):
     name = State()
     dose = State()
     time_str = State()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# ── Вспомогательные функции ───────────────────
 
 def parse_time(text: str):
-    """Return (hour, minute) or None."""
     text = text.strip().lower()
-    aliases = {"утром": (8, 0), "утро": (8, 0), "обед": (13, 0), "вечером": (20, 0), "ночью": (22, 0)}
+    aliases = {
+        "утром": (8, 0), "утро": (8, 0),
+        "обед": (13, 0), "обеде": (13, 0),
+        "вечером": (20, 0), "вечер": (20, 0),
+        "ночью": (22, 0),
+    }
     if text in aliases:
         return aliases[text]
     m = re.match(r"^(\d{1,2})[:\.](\d{2})$", text)
@@ -73,7 +82,7 @@ def time_label(h: int, mi: int) -> str:
 
 def vitamin_list_text(vitamins: list) -> str:
     if not vitamins:
-        return "У тебя пока нет витаминов. Добавь первый командой /add"
+        return "У тебя пока нет витаминов.\nДобавь первый командой /add"
     lines = []
     for i, v in enumerate(vitamins, 1):
         lines.append(f"{i}. 💊 <b>{v['name']}</b> — {v['dose']}, в {time_label(v['hour'], v['minute'])}")
@@ -101,7 +110,8 @@ def stats_text(user: dict) -> str:
         f"📈 Процент приёма: <b>{pct}%</b>"
     )
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
+
+# ── Клавиатуры ────────────────────────────────
 
 def reminder_kb(vitamin_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -113,24 +123,31 @@ def reminder_kb(vitamin_id: int) -> InlineKeyboardMarkup:
 
 def main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💊 Мои витамины", callback_data="list"),
-         InlineKeyboardButton(text="➕ Добавить", callback_data="add")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
-         InlineKeyboardButton(text="🗑 Удалить", callback_data="delete_menu")],
+        [
+            InlineKeyboardButton(text="💊 Мои витамины", callback_data="list"),
+            InlineKeyboardButton(text="➕ Добавить", callback_data="add"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data="delete_menu"),
+        ],
     ])
 
-# ── Bot & Dispatcher ──────────────────────────────────────────────────────────
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
+# ── Инициализация бота ────────────────────────
+
+from aiogram.client.default import DefaultBotProperties
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+
+# ── Команды ───────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message):
     await msg.answer(
         "👋 Привет! Я помогу не забывать принимать витамины.\n\n"
-        "Используй меню ниже или команды:\n"
+        "Команды:\n"
         "/add — добавить витамин\n"
         "/list — список витаминов\n"
         "/stats — статистика\n"
@@ -143,12 +160,12 @@ async def cmd_start(msg: Message):
 @dp.callback_query(F.data == "list")
 async def cmd_list(event):
     msg = event if isinstance(event, Message) else event.message
+    uid = msg.chat.id
     data = load_data()
-    user = get_user(data, msg.chat.id)
-    text = vitamin_list_text(user["vitamins"])
+    user = get_user(data, uid)
     if isinstance(event, CallbackQuery):
         await event.answer()
-    await msg.answer(text, reply_markup=main_kb())
+    await msg.answer(vitamin_list_text(user["vitamins"]), reply_markup=main_kb())
 
 
 @dp.message(Command("stats"))
@@ -162,7 +179,7 @@ async def cmd_stats(event):
     await msg.answer(stats_text(user), reply_markup=main_kb())
 
 
-# ── Add vitamin flow ──────────────────────────────────────────────────────────
+# ── Добавление витамина ───────────────────────
 
 @dp.message(Command("add"))
 @dp.callback_query(F.data == "add")
@@ -200,7 +217,6 @@ async def add_time(msg: Message, state: FSMContext):
     h, mi = parsed
     data_fsm = await state.get_data()
     await state.clear()
-
     data = load_data()
     user = get_user(data, msg.from_user.id)
     user["vitamins"].append({
@@ -218,7 +234,7 @@ async def add_time(msg: Message, state: FSMContext):
     )
 
 
-# ── Delete flow ───────────────────────────────────────────────────────────────
+# ── Удаление витамина ─────────────────────────
 
 @dp.message(Command("delete"))
 @dp.callback_query(F.data == "delete_menu")
@@ -254,7 +270,7 @@ async def do_delete(call: CallbackQuery):
     await call.message.edit_text("Витамин удалён.", reply_markup=main_kb())
 
 
-# ── Reminder callbacks ────────────────────────────────────────────────────────
+# ── Обработка напоминаний ─────────────────────
 
 def log_action(uid: int, vitamin_name: str, action: str):
     data = load_data()
@@ -309,10 +325,10 @@ async def cb_snooze(call: CallbackQuery):
         )
 
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
+# ── Планировщик напоминаний ───────────────────
 
 async def scheduler():
-    sent_today: set = set()  # (uid, vitamin_id, date)
+    sent_today: set = set()
     while True:
         now = datetime.now()
         data = load_data()
@@ -332,16 +348,24 @@ async def scheduler():
                         sent_today.add(key)
                     except Exception:
                         pass
-        # Clean old sent_today keys (keep only today)
         today = now.date().isoformat()
         sent_today = {k for k in sent_today if k[2] == today}
         await asyncio.sleep(30)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Запуск ────────────────────────────────────
 
 async def main():
+    if TOKEN == "YOUR_TOKEN_HERE":
+        print("=" * 50)
+        print("ОШИБКА: Вставь токен от @BotFather!")
+        print("Открой bot.py и замени YOUR_TOKEN_HERE")
+        print("=" * 50)
+        return
+    print("Бот запускается...")
     asyncio.create_task(scheduler())
+    print("Бот работает! Напиши /start в Telegram.")
+    print("Для остановки нажми Ctrl+C")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
