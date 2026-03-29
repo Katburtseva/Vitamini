@@ -1,501 +1,349 @@
-"""
-💊 Vitamin Reminder Bot — один файл, всё внутри
-"""
-
 import asyncio
-import logging
+import json
 import os
 import re
-import sqlite3
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
-# ─── Только WARNING и выше, без лишнего шума ──────────────────────────────────
-logging.basicConfig(format="%(levelname)s | %(message)s", level=logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.ERROR)
+# ── Config ────────────────────────────────────────────────────────────────────
+TOKEN = os.getenv("BOT_TOKEN", "8681677219:AAHXp6ckwJiX8QcWX4S9ZUMVJZ0uJXp1JB0")
+DATA_FILE = Path("data.json")
 
-# ─── Настройки ────────────────────────────────────────────────────────────────
-TIMEZONE = ZoneInfo("Europe/Moscow")   # ← меняйте под себя
-DB_PATH  = Path("vitamins.db")
+# ── Persistence ───────────────────────────────────────────────────────────────
 
-# ─── Состояния диалога ────────────────────────────────────────────────────────
-WAITING_NAME, WAITING_DOSE, WAITING_TIME = range(3)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  БАЗА ДАННЫХ
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_conn: sqlite3.Connection | None = None
+def load_data() -> dict:
+    if DATA_FILE.exists():
+        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    return {}
 
 
-def db() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.executescript("""
-            PRAGMA journal_mode=WAL;
-
-            CREATE TABLE IF NOT EXISTS users (
-                id      INTEGER PRIMARY KEY,
-                name    TEXT,
-                created TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS vitamins (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                name       TEXT NOT NULL,
-                dose       TEXT NOT NULL,
-                hour       INTEGER NOT NULL,
-                minute     INTEGER NOT NULL,
-                time_label TEXT NOT NULL,
-                active     INTEGER DEFAULT 1,
-                created    TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS logs (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                vitamin_id INTEGER NOT NULL,
-                status     TEXT DEFAULT 'pending',
-                created    TEXT DEFAULT (datetime('now'))
-            );
-        """)
-        _conn.commit()
-    return _conn
+def save_data(data: dict):
+    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def ensure_user(uid: int, name: str):
-    db().execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", (uid, name))
-    db().commit()
+def get_user(data: dict, uid: int) -> dict:
+    key = str(uid)
+    if key not in data:
+        data[key] = {"vitamins": [], "log": []}
+    return data[key]
 
+# ── FSM ───────────────────────────────────────────────────────────────────────
 
-def add_vitamin(uid, name, dose, hour, minute, time_label) -> int:
-    cur = db().execute(
-        "INSERT INTO vitamins (user_id,name,dose,hour,minute,time_label) VALUES (?,?,?,?,?,?)",
-        (uid, name, dose, hour, minute, time_label)
-    )
-    db().commit()
-    return cur.lastrowid
+class AddVitamin(StatesGroup):
+    name = State()
+    dose = State()
+    time_str = State()
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_vitamins(uid: int) -> list[dict]:
-    rows = db().execute(
-        "SELECT * FROM vitamins WHERE user_id=? ORDER BY hour,minute", (uid,)
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_vitamin(vid: int) -> dict | None:
-    row = db().execute("SELECT * FROM vitamins WHERE id=?", (vid,)).fetchone()
-    return dict(row) if row else None
-
-
-def get_all_active() -> list[dict]:
-    return [dict(r) for r in db().execute("SELECT * FROM vitamins WHERE active=1").fetchall()]
-
-
-def set_active(vid: int, active: bool):
-    db().execute("UPDATE vitamins SET active=? WHERE id=?", (1 if active else 0, vid))
-    db().commit()
-
-
-def delete_vitamin(vid: int):
-    db().execute("DELETE FROM logs WHERE vitamin_id=?", (vid,))
-    db().execute("DELETE FROM vitamins WHERE id=?", (vid,))
-    db().commit()
-
-
-def create_log(vid: int) -> int:
-    cur = db().execute("INSERT INTO logs (vitamin_id) VALUES (?)", (vid,))
-    db().commit()
-    return cur.lastrowid
-
-
-def mark_log(log_id: int, status: str):
-    db().execute("UPDATE logs SET status=? WHERE id=?", (status, log_id))
-    db().commit()
-
-
-def get_stats(uid: int) -> list[dict]:
-    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
-    rows = db().execute("""
-        SELECT v.name,
-               COUNT(l.id) AS total,
-               SUM(CASE WHEN l.status='taken'   THEN 1 ELSE 0 END) AS taken,
-               SUM(CASE WHEN l.status='skipped' THEN 1 ELSE 0 END) AS skipped
-        FROM vitamins v
-        LEFT JOIN logs l ON l.vitamin_id=v.id AND l.created>=?
-        WHERE v.user_id=?
-        GROUP BY v.id ORDER BY v.hour,v.minute
-    """, (cutoff, uid)).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ХЕЛПЕРЫ
-# ═══════════════════════════════════════════════════════════════════════════════
-
-ALIASES = {
-    "утром": "08:00", "утро": "08:00",
-    "обед": "13:00",  "днём": "13:00", "днем": "13:00",
-    "вечером": "19:00", "вечер": "19:00",
-    "ночью": "22:00",   "ночь": "22:00",
-}
-
-
-def parse_time(text: str) -> dtime | None:
-    text = ALIASES.get(text.strip().lower(), text.strip())
-    m = re.match(r"^(\d{1,2}):(\d{2})$", text)
+def parse_time(text: str):
+    """Return (hour, minute) or None."""
+    text = text.strip().lower()
+    aliases = {"утром": (8, 0), "утро": (8, 0), "обед": (13, 0), "вечером": (20, 0), "ночью": (22, 0)}
+    if text in aliases:
+        return aliases[text]
+    m = re.match(r"^(\d{1,2})[:\.](\d{2})$", text)
     if m:
-        h, mn = int(m.group(1)), int(m.group(2))
-        if 0 <= h < 24 and 0 <= mn < 60:
-            return dtime(h, mn)
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h < 24 and 0 <= mi < 60:
+            return h, mi
+    m = re.match(r"^(\d{1,2})$", text)
+    if m:
+        h = int(m.group(1))
+        if 0 <= h < 24:
+            return h, 0
     return None
 
 
-def fmt_vitamins(vitamins: list) -> str:
+def time_label(h: int, mi: int) -> str:
+    return f"{h:02d}:{mi:02d}"
+
+
+def vitamin_list_text(vitamins: list) -> str:
     if not vitamins:
-        return "Список пуст. Добавьте витамин через /add"
-    icons = ["💊","🔵","🟡","🟢","🔴","🟠","🟣"]
-    parts = []
-    for i, v in enumerate(vitamins):
-        e = icons[i % len(icons)]
-        status = "✅ Активен" if v["active"] else "⏸ Пауза"
-        parts.append(f"{e} <b>{v['name']}</b> — {v['dose']}\n   ⏰ {v['time_label']}  |  {status}")
-    return "\n\n".join(parts)
+        return "У тебя пока нет витаминов. Добавь первый командой /add"
+    lines = []
+    for i, v in enumerate(vitamins, 1):
+        lines.append(f"{i}. 💊 <b>{v['name']}</b> — {v['dose']}, в {time_label(v['hour'], v['minute'])}")
+    return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  КОМАНДЫ
-# ═══════════════════════════════════════════════════════════════════════════════
+def stats_text(user: dict) -> str:
+    log = user.get("log", [])
+    if not log:
+        return "Статистика пуста — начни принимать витамины!"
+    today = datetime.now().date().isoformat()
+    week_ago = (datetime.now().date() - timedelta(days=7)).isoformat()
+    taken = [e for e in log if e["action"] == "taken"]
+    skipped = [e for e in log if e["action"] == "skipped"]
+    taken_today = [e for e in taken if e["date"] == today]
+    taken_week = [e for e in taken if e["date"] >= week_ago]
+    total = len(taken) + len(skipped)
+    pct = round(len(taken) / total * 100) if total else 0
+    return (
+        f"📊 <b>Статистика</b>\n\n"
+        f"✅ Сегодня принято: <b>{len(taken_today)}</b>\n"
+        f"📅 За неделю принято: <b>{len(taken_week)}</b>\n"
+        f"🏆 Всего принято: <b>{len(taken)}</b>\n"
+        f"❌ Всего пропущено: <b>{len(skipped)}</b>\n"
+        f"📈 Процент приёма: <b>{pct}%</b>"
+    )
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    ensure_user(u.id, u.first_name)
-    await update.message.reply_text(
-        f"Привет, {u.first_name}! 👋\n\n"
-        "Я напомню принять витамины вовремя.\n\n"
-        "<b>Команды:</b>\n"
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+
+def reminder_kb(vitamin_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Выпила", callback_data=f"taken:{vitamin_id}"),
+        InlineKeyboardButton(text="⏰ +10 мин", callback_data=f"snooze:{vitamin_id}"),
+        InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip:{vitamin_id}"),
+    ]])
+
+
+def main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💊 Мои витамины", callback_data="list"),
+         InlineKeyboardButton(text="➕ Добавить", callback_data="add")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+         InlineKeyboardButton(text="🗑 Удалить", callback_data="delete_menu")],
+    ])
+
+# ── Bot & Dispatcher ──────────────────────────────────────────────────────────
+
+bot = Bot(token=TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+@dp.message(CommandStart())
+async def cmd_start(msg: Message):
+    await msg.answer(
+        "👋 Привет! Я помогу не забывать принимать витамины.\n\n"
+        "Используй меню ниже или команды:\n"
         "/add — добавить витамин\n"
-        "/list — мой список\n"
+        "/list — список витаминов\n"
         "/stats — статистика\n"
-        "/pause — пауза / возобновить\n"
-        "/delete — удалить\n"
-        "/help — справка по времени",
-        parse_mode="HTML"
+        "/delete — удалить витамин",
+        reply_markup=main_kb(),
     )
 
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⏰ <b>Как указать время:</b>\n"
-        "• <code>08:30</code> — точное время\n"
-        "• <code>утром</code> → 08:00\n"
-        "• <code>обед</code> → 13:00\n"
-        "• <code>вечером</code> → 19:00\n"
-        "• <code>ночью</code> → 22:00",
-        parse_mode="HTML"
+@dp.message(Command("list"))
+@dp.callback_query(F.data == "list")
+async def cmd_list(event):
+    msg = event if isinstance(event, Message) else event.message
+    data = load_data()
+    user = get_user(data, msg.chat.id)
+    text = vitamin_list_text(user["vitamins"])
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+    await msg.answer(text, reply_markup=main_kb())
+
+
+@dp.message(Command("stats"))
+@dp.callback_query(F.data == "stats")
+async def cmd_stats(event):
+    msg = event if isinstance(event, Message) else event.message
+    data = load_data()
+    user = get_user(data, msg.chat.id)
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+    await msg.answer(stats_text(user), reply_markup=main_kb())
+
+
+# ── Add vitamin flow ──────────────────────────────────────────────────────────
+
+@dp.message(Command("add"))
+@dp.callback_query(F.data == "add")
+async def cmd_add(event, state: FSMContext):
+    msg = event if isinstance(event, Message) else event.message
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+    await state.set_state(AddVitamin.name)
+    await msg.answer("💊 Как называется витамин?\n<i>Например: Магний B6, Витамин D, Омега-3</i>")
+
+
+@dp.message(AddVitamin.name)
+async def add_name(msg: Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip())
+    await state.set_state(AddVitamin.dose)
+    await msg.answer("📏 Какая доза?\n<i>Например: 1 таблетка, 2 капсулы, 5 мл</i>")
+
+
+@dp.message(AddVitamin.dose)
+async def add_dose(msg: Message, state: FSMContext):
+    await state.update_data(dose=msg.text.strip())
+    await state.set_state(AddVitamin.time_str)
+    await msg.answer(
+        "⏰ В какое время напоминать?\n"
+        "<i>Например: 21:00, 8:30, утром, обед, вечером</i>"
     )
 
 
-async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    vitamins = get_vitamins(update.effective_user.id)
-    kb = [[
-        InlineKeyboardButton("➕ Добавить", callback_data="add_new"),
-        InlineKeyboardButton("⚙️ Управление", callback_data="manage"),
-    ]] if vitamins else [[InlineKeyboardButton("➕ Добавить первый", callback_data="add_new")]]
-    await update.message.reply_text(
-        "💊 <b>Ваши витамины:</b>\n\n" + fmt_vitamins(vitamins),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    stats = get_stats(update.effective_user.id)
-    if not stats:
-        await update.message.reply_text("Статистики пока нет — начните принимать витамины!")
+@dp.message(AddVitamin.time_str)
+async def add_time(msg: Message, state: FSMContext):
+    parsed = parse_time(msg.text)
+    if not parsed:
+        await msg.answer("❗ Не понял время. Попробуй: <b>21:00</b>, <b>8:30</b>, <b>утром</b>, <b>обед</b>")
         return
-    lines = ["📊 <b>Статистика за 30 дней:</b>\n"]
-    for s in stats:
-        pct = s["taken"] / s["total"] * 100 if s["total"] else 0
-        bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
-        e = "🟢" if pct >= 80 else "🟡" if pct >= 50 else "🔴"
-        lines.append(
-            f"{e} <b>{s['name']}</b>\n"
-            f"   {bar} {pct:.0f}%\n"
-            f"   ✅ {s['taken']} из {s['total']} напоминаний"
-        )
-    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
+    h, mi = parsed
+    data_fsm = await state.get_data()
+    await state.clear()
+
+    data = load_data()
+    user = get_user(data, msg.from_user.id)
+    user["vitamins"].append({
+        "id": int(datetime.now().timestamp() * 1000),
+        "name": data_fsm["name"],
+        "dose": data_fsm["dose"],
+        "hour": h,
+        "minute": mi,
+    })
+    save_data(data)
+    await msg.answer(
+        f"✅ Добавлено!\n\n💊 <b>{data_fsm['name']}</b>\n"
+        f"📏 {data_fsm['dose']}\n⏰ {time_label(h, mi)}",
+        reply_markup=main_kb(),
+    )
 
 
-async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    vitamins = get_vitamins(update.effective_user.id)
-    if not vitamins:
-        await update.message.reply_text("Список пуст.")
+# ── Delete flow ───────────────────────────────────────────────────────────────
+
+@dp.message(Command("delete"))
+@dp.callback_query(F.data == "delete_menu")
+async def cmd_delete_menu(event):
+    msg = event if isinstance(event, Message) else event.message
+    data = load_data()
+    user = get_user(data, msg.chat.id)
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+    if not user["vitamins"]:
+        await msg.answer("Нечего удалять.", reply_markup=main_kb())
         return
-    kb = [[InlineKeyboardButton(
-        f"{'▶️' if not v['active'] else '⏸'} {v['name']}",
-        callback_data=f"toggle_{v['id']}"
-    )] for v in vitamins]
-    await update.message.reply_text("Нажмите для паузы / возобновления:", reply_markup=InlineKeyboardMarkup(kb))
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"🗑 {v['name']} ({time_label(v['hour'], v['minute'])})",
+            callback_data=f"del:{v['id']}"
+        )]
+        for v in user["vitamins"]
+    ]
+    buttons.append([InlineKeyboardButton(text="← Назад", callback_data="list")])
+    await msg.answer("Выбери витамин для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
-async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    vitamins = get_vitamins(update.effective_user.id)
-    if not vitamins:
-        await update.message.reply_text("Список пуст.")
-        return
-    kb = [[InlineKeyboardButton(f"🗑 {v['name']}", callback_data=f"del_{v['id']}")] for v in vitamins]
-    await update.message.reply_text("Выберите витамин для удаления:", reply_markup=InlineKeyboardMarkup(kb))
+@dp.callback_query(F.data.startswith("del:"))
+async def do_delete(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    data = load_data()
+    user = get_user(data, call.from_user.id)
+    before = len(user["vitamins"])
+    user["vitamins"] = [v for v in user["vitamins"] if v["id"] != vid]
+    save_data(data)
+    await call.answer("Удалено ✅" if len(user["vitamins"]) < before else "Не найдено")
+    await call.message.edit_text("Витамин удалён.", reply_markup=main_kb())
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ДОБАВЛЕНИЕ ВИТАМИНА
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Reminder callbacks ────────────────────────────────────────────────────────
 
-CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_add")]])
-
-
-async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message or update.callback_query.message
-    await msg.reply_text(
-        "➕ <b>Добавление витамина</b>\n\nШаг 1/3: Название витамина?\n"
-        "<i>Например: Магний B6, Витамин D3, Омега-3</i>",
-        parse_mode="HTML", reply_markup=CANCEL_KB
-    )
-    return WAITING_NAME
+def log_action(uid: int, vitamin_name: str, action: str):
+    data = load_data()
+    user = get_user(data, uid)
+    user["log"].append({
+        "action": action,
+        "vitamin": vitamin_name,
+        "date": datetime.now().date().isoformat(),
+        "time": datetime.now().strftime("%H:%M"),
+    })
+    save_data(data)
 
 
-async def got_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"✅ <b>{ctx.user_data['name']}</b>\n\nШаг 2/3: Дозировка?\n"
-        "<i>Например: 1 таблетка, 2 капсулы, 5 мл</i>",
-        parse_mode="HTML", reply_markup=CANCEL_KB
-    )
-    return WAITING_DOSE
+@dp.callback_query(F.data.startswith("taken:"))
+async def cb_taken(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    data = load_data()
+    user = get_user(data, call.from_user.id)
+    v = next((x for x in user["vitamins"] if x["id"] == vid), None)
+    name = v["name"] if v else "витамин"
+    log_action(call.from_user.id, name, "taken")
+    await call.answer("Отлично! 💪")
+    await call.message.edit_text(f"✅ <b>{name}</b> принят! Молодец!")
 
 
-async def got_dose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["dose"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"✅ Доза: <b>{ctx.user_data['dose']}</b>\n\nШаг 3/3: Время напоминания?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌅 Утром 08:00",  callback_data="time_утром"),
-             InlineKeyboardButton("☀️ Обед 13:00",  callback_data="time_обед")],
-            [InlineKeyboardButton("🌆 Вечер 19:00", callback_data="time_вечером"),
-             InlineKeyboardButton("🌙 Ночь 22:00",  callback_data="time_ночью")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_add")],
-        ])
-    )
-    return WAITING_TIME
+@dp.callback_query(F.data.startswith("skip:"))
+async def cb_skip(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    data = load_data()
+    user = get_user(data, call.from_user.id)
+    v = next((x for x in user["vitamins"] if x["id"] == vid), None)
+    name = v["name"] if v else "витамин"
+    log_action(call.from_user.id, name, "skipped")
+    await call.answer("Хорошо, пропускаем.")
+    await call.message.edit_text(f"❌ <b>{name}</b> пропущен.")
 
 
-async def got_time_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    return await _save(update, ctx, update.message.text.strip())
-
-
-async def got_time_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    return await _save(update, ctx, update.callback_query.data.replace("time_", ""), cb=True)
-
-
-async def _save(update, ctx, time_str: str, cb=False):
-    t = parse_time(time_str)
-    msg = update.callback_query.message if cb else update.message
-    if t is None:
-        await msg.reply_text(
-            "⚠️ Не понял время. Напишите <code>HH:MM</code> или слово: утром / обед / вечером / ночью",
-            parse_mode="HTML"
-        )
-        return WAITING_TIME
-
-    uid = update.effective_user.id
-    vid = add_vitamin(uid, ctx.user_data["name"], ctx.user_data["dose"], t.hour, t.minute, time_str)
-    schedule_vitamin(ctx.application, uid, vid, ctx.user_data["name"], ctx.user_data["dose"], t.hour, t.minute)
-
-    await msg.reply_text(
-        f"🎉 <b>{ctx.user_data['name']}</b> добавлен!\n⏰ Буду напоминать в <b>{t.strftime('%H:%M')}</b>",
-        parse_mode="HTML"
-    )
-    ctx.user_data.clear()
-    return ConversationHandler.END
-
-
-async def cancel_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text("❌ Отменено.")
-    ctx.user_data.clear()
-    return ConversationHandler.END
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  КНОПКИ (напоминание + управление)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def handle_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data, uid = q.data, update.effective_user.id
-
-    if data.startswith("taken_"):
-        _, vid, log_id = data.split("_")
-        mark_log(int(log_id), "taken")
-        vit = get_vitamin(int(vid))
-        await q.edit_message_text(f"✅ <b>{vit['name']}</b> принят! Молодец 💪", parse_mode="HTML")
-
-    elif data.startswith("snooze_"):
-        _, vid, log_id = data.split("_")
-        vit = get_vitamin(int(vid))
-        await q.edit_message_text(f"⏰ Напомню про <b>{vit['name']}</b> через 10 минут", parse_mode="HTML")
-        ctx.job_queue.run_once(
-            send_reminder,
-            when=600,
-            data={"chat_id": uid, "vid": int(vid), "name": vit["name"], "dose": vit["dose"]},
-            name=f"snooze_{uid}_{vid}",
+@dp.callback_query(F.data.startswith("snooze:"))
+async def cb_snooze(call: CallbackQuery):
+    vid = int(call.data.split(":")[1])
+    await call.answer("⏰ Напомню через 10 минут!")
+    await call.message.edit_text("⏰ Напомню через 10 минут...")
+    await asyncio.sleep(600)
+    data = load_data()
+    user = get_user(data, call.from_user.id)
+    v = next((x for x in user["vitamins"] if x["id"] == vid), None)
+    if v:
+        await bot.send_message(
+            call.from_user.id,
+            f"🔔 Повторное напоминание!\n💊 <b>{v['name']}</b> — {v['dose']}",
+            reply_markup=reminder_kb(vid),
         )
 
-    elif data.startswith("skip_"):
-        _, vid, log_id = data.split("_")
-        mark_log(int(log_id), "skipped")
-        vit = get_vitamin(int(vid))
-        await q.edit_message_text(f"❌ <b>{vit['name']}</b> пропущен.", parse_mode="HTML")
 
-    elif data.startswith("toggle_"):
-        vid = int(data.replace("toggle_", ""))
-        vit = get_vitamin(vid)
-        new_state = not vit["active"]
-        set_active(vid, new_state)
-        if new_state:
-            schedule_vitamin(ctx.application, uid, vid, vit["name"], vit["dose"], vit["hour"], vit["minute"])
-            await q.edit_message_text(f"▶️ <b>{vit['name']}</b> возобновлён.", parse_mode="HTML")
-        else:
-            _remove_job(ctx.application, uid, vid)
-            await q.edit_message_text(f"⏸ <b>{vit['name']}</b> на паузе.", parse_mode="HTML")
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
-    elif data.startswith("del_"):
-        vid = int(data.replace("del_", ""))
-        vit = get_vitamin(vid)
-        _remove_job(ctx.application, uid, vid)
-        delete_vitamin(vid)
-        await q.edit_message_text(f"🗑 <b>{vit['name']}</b> удалён.", parse_mode="HTML")
-
-    elif data == "add_new":
-        await q.message.reply_text(
-            "➕ <b>Добавление витамина</b>\n\nШаг 1/3: Название витамина?",
-            parse_mode="HTML"
-        )
-
-    elif data == "manage":
-        vitamins = get_vitamins(uid)
-        kb = (
-            [[InlineKeyboardButton(f"{'⏸' if v['active'] else '▶️'} {v['name']}", callback_data=f"toggle_{v['id']}")] for v in vitamins]
-            + [[InlineKeyboardButton(f"🗑 {v['name']}", callback_data=f"del_{v['id']}")] for v in vitamins]
-        )
-        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+async def scheduler():
+    sent_today: set = set()  # (uid, vitamin_id, date)
+    while True:
+        now = datetime.now()
+        data = load_data()
+        for uid_str, user in data.items():
+            uid = int(uid_str)
+            for v in user.get("vitamins", []):
+                key = (uid, v["id"], now.date().isoformat())
+                if key in sent_today:
+                    continue
+                if now.hour == v["hour"] and now.minute == v["minute"]:
+                    try:
+                        await bot.send_message(
+                            uid,
+                            f"💊 Время принять <b>{v['name']}</b>!\n📏 {v['dose']}",
+                            reply_markup=reminder_kb(v["id"]),
+                        )
+                        sent_today.add(key)
+                    except Exception:
+                        pass
+        # Clean old sent_today keys (keep only today)
+        today = now.date().isoformat()
+        sent_today = {k for k in sent_today if k[2] == today}
+        await asyncio.sleep(30)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  РАСПИСАНИЕ
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Entry point ───────────────────────────────────────────────────────────────
 
-async def send_reminder(ctx: ContextTypes.DEFAULT_TYPE):
-    d = ctx.job.data
-    log_id = create_log(d["vid"])
-    await ctx.bot.send_message(
-        chat_id=d["chat_id"],
-        text=f"💊 <b>Время принять {d['name']}!</b>\n📏 Доза: {d['dose']}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Выпил(а)", callback_data=f"taken_{d['vid']}_{log_id}"),
-             InlineKeyboardButton("⏰ +10 мин",  callback_data=f"snooze_{d['vid']}_{log_id}")],
-            [InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{d['vid']}_{log_id}")],
-        ])
-    )
-
-
-def schedule_vitamin(app, uid, vid, name, dose, hour, minute):
-    _remove_job(app, uid, vid)
-    app.job_queue.run_daily(
-        send_reminder,
-        time=dtime(hour=hour, minute=minute, tzinfo=TIMEZONE),
-        data={"chat_id": uid, "vid": vid, "name": name, "dose": dose},
-        name=f"vit_{uid}_{vid}",
-    )
-
-
-def _remove_job(app, uid, vid):
-    jobs = app.job_queue.get_jobs_by_name(f"vit_{uid}_{vid}")
-    for j in jobs:
-        j.schedule_removal()
-
-
-async def restore_schedules(app):
-    for v in get_all_active():
-        schedule_vitamin(app, v["user_id"], v["id"], v["name"], v["dose"], v["hour"], v["minute"])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ТОЧКА ВХОДА
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Установите переменную окружения BOT_TOKEN")
-
-    app = Application.builder().token(token).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("add", cmd_add), CallbackQueryHandler(cmd_add, pattern="^add_new$")],
-        states={
-            WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
-            WAITING_DOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dose)],
-            WAITING_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, got_time_text),
-                CallbackQueryHandler(got_time_btn, pattern="^time_"),
-                CallbackQueryHandler(cancel_add, pattern="^cancel_add$"),
-            ],
-        },
-        fallbacks=[
-            CallbackQueryHandler(cancel_add, pattern="^cancel_add$"),
-            CommandHandler("start", cmd_start),
-        ],
-    )
-
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("list",   cmd_list))
-    app.add_handler(CommandHandler("stats",  cmd_stats))
-    app.add_handler(CommandHandler("pause",  cmd_pause))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(handle_callbacks))
-
-    async def on_start(a):
-        await restore_schedules(a)
-
-    app.post_init = on_start
-
-    print("🤖 Бот запущен. Ctrl+C для остановки.")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+async def main():
+    asyncio.create_task(scheduler())
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
