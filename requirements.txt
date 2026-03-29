@@ -1,2 +1,4 @@
-
 aiogram==3.13.1
+pydantic==2.7.4
+aiohttp
+
