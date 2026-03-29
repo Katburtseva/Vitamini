@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]==21.6
+
 aiogram==3.13.1
